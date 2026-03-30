@@ -312,9 +312,18 @@ class AutoApproveClientsStore {
     this.clients = new Map();
   }
   async getClient(clientId) {
-    return this.clients.get(clientId);
+    const client = this.clients.get(clientId);
+    console.log(`[AUTH] getClient(${clientId}): ${client ? "found" : "NOT FOUND"}`);
+    return client;
   }
   async registerClient(clientMetadata) {
+    console.log(`[AUTH] registerClient:`, JSON.stringify({
+      client_id: clientMetadata.client_id,
+      client_name: clientMetadata.client_name,
+      redirect_uris: clientMetadata.redirect_uris,
+      token_endpoint_auth_method: clientMetadata.token_endpoint_auth_method,
+      has_secret: !!clientMetadata.client_secret,
+    }));
     this.clients.set(clientMetadata.client_id, clientMetadata);
     return clientMetadata;
   }
@@ -328,7 +337,7 @@ class AutoApproveAuthProvider {
   }
 
   async authorize(client, params, res) {
-    // Auto-approve: immediately issue an auth code and redirect back
+    console.log(`[AUTH] authorize: client=${client.client_id}, redirectUri=${params.redirectUri}, state=${params.state}, scopes=${params.scopes}`);
     const code = randomUUID();
     this.codes.set(code, { client, params });
 
@@ -337,19 +346,26 @@ class AutoApproveAuthProvider {
     if (params.state) {
       targetUrl.searchParams.set("state", params.state);
     }
+    console.log(`[AUTH] authorize: redirecting with code=${code}`);
     res.redirect(targetUrl.toString());
   }
 
   async challengeForAuthorizationCode(_client, authorizationCode) {
     const codeData = this.codes.get(authorizationCode);
+    console.log(`[AUTH] challengeForAuthorizationCode(${authorizationCode}): ${codeData ? "found" : "NOT FOUND"}, stored codes: ${this.codes.size}`);
     if (!codeData) throw new Error("Invalid authorization code");
     return codeData.params.codeChallenge;
   }
 
   async exchangeAuthorizationCode(client, authorizationCode) {
+    console.log(`[AUTH] exchangeAuthorizationCode: client=${client.client_id}, code=${authorizationCode}`);
     const codeData = this.codes.get(authorizationCode);
-    if (!codeData) throw new Error("Invalid authorization code");
+    if (!codeData) {
+      console.error(`[AUTH] FAIL: auth code not found. Stored codes: ${[...this.codes.keys()].join(", ")}`);
+      throw new Error("Invalid authorization code");
+    }
     if (codeData.client.client_id !== client.client_id) {
+      console.error(`[AUTH] FAIL: client mismatch. Code issued to ${codeData.client.client_id}, request from ${client.client_id}`);
       throw new Error("Authorization code was not issued to this client");
     }
     this.codes.delete(authorizationCode);
@@ -358,9 +374,10 @@ class AutoApproveAuthProvider {
     this.tokens.set(token, {
       clientId: client.client_id,
       scopes: codeData.params.scopes || [],
-      expiresAt: Date.now() + 3600000 * 24, // 24 hours
+      expiresAt: Date.now() + 3600000 * 24,
     });
 
+    console.log(`[AUTH] exchangeAuthorizationCode: SUCCESS, issued token`);
     return {
       access_token: token,
       token_type: "bearer",
@@ -370,11 +387,13 @@ class AutoApproveAuthProvider {
   }
 
   async exchangeRefreshToken() {
+    console.log(`[AUTH] exchangeRefreshToken: not supported`);
     throw new Error("Refresh tokens not supported");
   }
 
   async verifyAccessToken(token) {
     const tokenData = this.tokens.get(token);
+    console.log(`[AUTH] verifyAccessToken: ${tokenData ? "valid" : "INVALID"}, stored tokens: ${this.tokens.size}`);
     if (!tokenData || tokenData.expiresAt < Date.now()) {
       throw new Error("Invalid or expired token");
     }
@@ -419,6 +438,25 @@ app.use((req, res, next) => {
 // Health check (before auth)
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
+});
+
+// Log all auth-related requests
+app.use((req, res, next) => {
+  const authPaths = ["/register", "/authorize", "/token", "/sse", "/messages", "/mcp", "/.well-known"];
+  if (authPaths.some((p) => req.path.startsWith(p))) {
+    console.log(`[REQ] ${req.method} ${req.path}`, {
+      query: req.query,
+      contentType: req.headers["content-type"],
+      hasAuth: !!req.headers.authorization,
+      body: req.method === "POST" ? JSON.stringify(req.body) : undefined,
+    });
+    const origEnd = res.end.bind(res);
+    res.end = function (...args) {
+      console.log(`[RES] ${req.method} ${req.path} → ${res.statusCode}`);
+      return origEnd(...args);
+    };
+  }
+  next();
 });
 
 // OAuth auth router — handles discovery, registration, authorize, token endpoints
