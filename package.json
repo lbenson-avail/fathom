@@ -1,0 +1,19 @@
+{
+  "name": "fathom-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for querying Fathom meeting data",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "fathom-mcp-server": "src/index.js"
+  },
+  "scripts": {
+    "start": "node --env-file=.env src/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
