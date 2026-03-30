@@ -422,11 +422,14 @@ app.get("/health", (req, res) => {
 });
 
 // OAuth auth router — handles discovery, registration, authorize, token endpoints
+// resourceServerUrl must include /sse so that RFC 9728 metadata is served at
+// /.well-known/oauth-protected-resource/sse (the path Claude.ai looks for)
 app.use(
   mcpAuthRouter({
     provider: authProvider,
     issuerUrl: new URL(BASE_URL),
     baseUrl: new URL(BASE_URL),
+    resourceServerUrl: new URL("/sse", BASE_URL),
     scopesSupported: ["mcp:tools"],
     resourceName: "Fathom MCP Server",
   })
