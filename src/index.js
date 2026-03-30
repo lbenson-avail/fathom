@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { z } from "zod";
 
 const FATHOM_API_BASE = "https://api.fathom.ai/external/v1";
@@ -83,10 +87,7 @@ function formatMeetingShort(m) {
 
 // --- MCP Server ---
 
-const server = new McpServer({
-  name: "fathom",
-  version: "1.0.0",
-});
+function registerTools(server) {
 
 // Tool: list_meetings
 server.tool(
@@ -301,7 +302,97 @@ server.tool(
   }
 );
 
-// --- Start ---
+} // end registerTools
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+// --- HTTP/SSE Transport ---
+
+const app = createMcpExpressApp({ host: "0.0.0.0" });
+const transports = {};
+
+// Streamable HTTP transport (current protocol)
+app.all("/mcp", async (req, res) => {
+  try {
+    const sessionId = req.headers["mcp-session-id"];
+    let transport;
+
+    if (sessionId && transports[sessionId]) {
+      transport = transports[sessionId];
+      if (!(transport instanceof StreamableHTTPServerTransport)) {
+        res.status(400).json({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Session uses a different transport" },
+          id: null,
+        });
+        return;
+      }
+    } else if (!sessionId && req.method === "POST" && isInitializeRequest(req.body)) {
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (sid) => {
+          transports[sid] = transport;
+        },
+      });
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid) delete transports[sid];
+      };
+      const s = new McpServer({ name: "fathom", version: "1.0.0" });
+      registerTools(s);
+      await s.connect(transport);
+    } else {
+      res.status(400).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Bad Request: No valid session ID" },
+        id: null,
+      });
+      return;
+    }
+
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    console.error("Error handling /mcp:", error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: "Internal server error" },
+        id: null,
+      });
+    }
+  }
+});
+
+// Legacy SSE transport (for older clients)
+app.get("/sse", async (req, res) => {
+  const transport = new SSEServerTransport("/messages", res);
+  transports[transport.sessionId] = transport;
+  res.on("close", () => delete transports[transport.sessionId]);
+  const s = new McpServer({ name: "fathom", version: "1.0.0" });
+  registerTools(s);
+  await s.connect(transport);
+});
+
+app.post("/messages", async (req, res) => {
+  const sessionId = req.query.sessionId;
+  const transport = transports[sessionId];
+  if (transport instanceof SSEServerTransport) {
+    await transport.handlePostMessage(req, res, req.body);
+  } else {
+    res.status(400).send("No transport found for sessionId");
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Fathom MCP server listening on port ${PORT}`);
+  console.log(`  Streamable HTTP: /mcp`);
+  console.log(`  Legacy SSE:      /sse + /messages`);
+});
+
+process.on("SIGINT", async () => {
+  console.log("Shutting down...");
+  for (const sid in transports) {
+    try { await transports[sid].close(); } catch {}
+    delete transports[sid];
+  }
+  process.exit(0);
+});
