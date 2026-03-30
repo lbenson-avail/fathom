@@ -5,7 +5,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { z } from "zod";
 
 const FATHOM_API_BASE = "https://api.fathom.ai/external/v1";
@@ -306,10 +305,57 @@ server.tool(
 
 // --- HTTP/SSE Transport ---
 
-const app = createMcpExpressApp({ host: "0.0.0.0" });
+import express from "express";
+
+const app = express();
+app.use(express.json());
+
+// CORS — required for remote MCP clients
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
+  res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
+  next();
+});
+
 const transports = {};
 
-// Streamable HTTP transport (current protocol)
+// Health check
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+// SSE transport — GET /sse establishes the stream
+app.get("/sse", async (req, res) => {
+  console.log("SSE connection established");
+  const transport = new SSEServerTransport("/messages", res);
+  transports[transport.sessionId] = transport;
+  res.on("close", () => {
+    console.log(`SSE session ${transport.sessionId} closed`);
+    delete transports[transport.sessionId];
+  });
+  const s = new McpServer({ name: "fathom", version: "1.0.0" });
+  registerTools(s);
+  await s.connect(transport);
+});
+
+// SSE transport — POST /messages sends messages to the server
+app.post("/messages", async (req, res) => {
+  const sessionId = req.query.sessionId;
+  const transport = transports[sessionId];
+  if (transport instanceof SSEServerTransport) {
+    await transport.handlePostMessage(req, res, req.body);
+  } else {
+    res.status(400).send("No transport found for sessionId");
+  }
+});
+
+// Streamable HTTP transport (newer protocol)
 app.all("/mcp", async (req, res) => {
   try {
     const sessionId = req.headers["mcp-session-id"];
@@ -361,31 +407,12 @@ app.all("/mcp", async (req, res) => {
   }
 });
 
-// Legacy SSE transport (for older clients)
-app.get("/sse", async (req, res) => {
-  const transport = new SSEServerTransport("/messages", res);
-  transports[transport.sessionId] = transport;
-  res.on("close", () => delete transports[transport.sessionId]);
-  const s = new McpServer({ name: "fathom", version: "1.0.0" });
-  registerTools(s);
-  await s.connect(transport);
-});
-
-app.post("/messages", async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const transport = transports[sessionId];
-  if (transport instanceof SSEServerTransport) {
-    await transport.handlePostMessage(req, res, req.body);
-  } else {
-    res.status(400).send("No transport found for sessionId");
-  }
-});
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Fathom MCP server listening on port ${PORT}`);
+  console.log(`  SSE:             /sse + /messages`);
   console.log(`  Streamable HTTP: /mcp`);
-  console.log(`  Legacy SSE:      /sse + /messages`);
+  console.log(`  Health:          /health`);
 });
 
 process.on("SIGINT", async () => {
