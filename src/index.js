@@ -5,6 +5,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { z } from "zod";
 
 const FATHOM_API_BASE = "https://api.fathom.ai/external/v1";
@@ -303,9 +305,97 @@ server.tool(
 
 } // end registerTools
 
+// --- OAuth Provider (auto-approve, server-side API key) ---
+
+class AutoApproveClientsStore {
+  constructor() {
+    this.clients = new Map();
+  }
+  async getClient(clientId) {
+    return this.clients.get(clientId);
+  }
+  async registerClient(clientMetadata) {
+    this.clients.set(clientMetadata.client_id, clientMetadata);
+    return clientMetadata;
+  }
+}
+
+class AutoApproveAuthProvider {
+  constructor() {
+    this.clientsStore = new AutoApproveClientsStore();
+    this.codes = new Map();
+    this.tokens = new Map();
+  }
+
+  async authorize(client, params, res) {
+    // Auto-approve: immediately issue an auth code and redirect back
+    const code = randomUUID();
+    this.codes.set(code, { client, params });
+
+    const targetUrl = new URL(params.redirectUri);
+    targetUrl.searchParams.set("code", code);
+    if (params.state) {
+      targetUrl.searchParams.set("state", params.state);
+    }
+    res.redirect(targetUrl.toString());
+  }
+
+  async challengeForAuthorizationCode(_client, authorizationCode) {
+    const codeData = this.codes.get(authorizationCode);
+    if (!codeData) throw new Error("Invalid authorization code");
+    return codeData.params.codeChallenge;
+  }
+
+  async exchangeAuthorizationCode(client, authorizationCode) {
+    const codeData = this.codes.get(authorizationCode);
+    if (!codeData) throw new Error("Invalid authorization code");
+    if (codeData.client.client_id !== client.client_id) {
+      throw new Error("Authorization code was not issued to this client");
+    }
+    this.codes.delete(authorizationCode);
+
+    const token = randomUUID();
+    this.tokens.set(token, {
+      clientId: client.client_id,
+      scopes: codeData.params.scopes || [],
+      expiresAt: Date.now() + 3600000 * 24, // 24 hours
+    });
+
+    return {
+      access_token: token,
+      token_type: "bearer",
+      expires_in: 3600 * 24,
+      scope: (codeData.params.scopes || []).join(" "),
+    };
+  }
+
+  async exchangeRefreshToken() {
+    throw new Error("Refresh tokens not supported");
+  }
+
+  async verifyAccessToken(token) {
+    const tokenData = this.tokens.get(token);
+    if (!tokenData || tokenData.expiresAt < Date.now()) {
+      throw new Error("Invalid or expired token");
+    }
+    return {
+      token,
+      clientId: tokenData.clientId,
+      scopes: tokenData.scopes,
+      expiresAt: Math.floor(tokenData.expiresAt / 1000),
+    };
+  }
+}
+
 // --- HTTP/SSE Transport ---
 
 import express from "express";
+
+const BASE_URL = process.env.RAILWAY_PUBLIC_DOMAIN
+  ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+  : `http://localhost:${process.env.PORT || 3000}`;
+
+const authProvider = new AutoApproveAuthProvider();
 
 const app = express();
 app.use(express.json());
@@ -314,7 +404,10 @@ app.use(express.json());
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept, Mcp-Session-Id");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Accept, Authorization, Mcp-Session-Id"
+  );
   res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
   if (req.method === "OPTIONS") {
     res.status(204).end();
@@ -323,15 +416,31 @@ app.use((req, res, next) => {
   next();
 });
 
-const transports = {};
-
-// Health check
+// Health check (before auth)
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
+// OAuth auth router — handles discovery, registration, authorize, token endpoints
+app.use(
+  mcpAuthRouter({
+    provider: authProvider,
+    issuerUrl: new URL(BASE_URL),
+    baseUrl: new URL(BASE_URL),
+    scopesSupported: ["mcp:tools"],
+    resourceName: "Fathom MCP Server",
+  })
+);
+
+// Bearer auth middleware for MCP endpoints
+const authMiddleware = requireBearerAuth({
+  verifier: authProvider,
+});
+
+const transports = {};
+
 // SSE transport — GET /sse establishes the stream
-app.get("/sse", async (req, res) => {
+app.get("/sse", authMiddleware, async (req, res) => {
   console.log("SSE connection established");
   const transport = new SSEServerTransport("/messages", res);
   transports[transport.sessionId] = transport;
@@ -345,7 +454,7 @@ app.get("/sse", async (req, res) => {
 });
 
 // SSE transport — POST /messages sends messages to the server
-app.post("/messages", async (req, res) => {
+app.post("/messages", authMiddleware, async (req, res) => {
   const sessionId = req.query.sessionId;
   const transport = transports[sessionId];
   if (transport instanceof SSEServerTransport) {
@@ -356,7 +465,7 @@ app.post("/messages", async (req, res) => {
 });
 
 // Streamable HTTP transport (newer protocol)
-app.all("/mcp", async (req, res) => {
+app.all("/mcp", authMiddleware, async (req, res) => {
   try {
     const sessionId = req.headers["mcp-session-id"];
     let transport;
@@ -371,7 +480,11 @@ app.all("/mcp", async (req, res) => {
         });
         return;
       }
-    } else if (!sessionId && req.method === "POST" && isInitializeRequest(req.body)) {
+    } else if (
+      !sessionId &&
+      req.method === "POST" &&
+      isInitializeRequest(req.body)
+    ) {
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid) => {
@@ -410,6 +523,7 @@ app.all("/mcp", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Fathom MCP server listening on port ${PORT}`);
+  console.log(`  Base URL:        ${BASE_URL}`);
   console.log(`  SSE:             /sse + /messages`);
   console.log(`  Streamable HTTP: /mcp`);
   console.log(`  Health:          /health`);
@@ -418,7 +532,9 @@ app.listen(PORT, "0.0.0.0", () => {
 process.on("SIGINT", async () => {
   console.log("Shutting down...");
   for (const sid in transports) {
-    try { await transports[sid].close(); } catch {}
+    try {
+      await transports[sid].close();
+    } catch {}
     delete transports[sid];
   }
   process.exit(0);
