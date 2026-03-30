@@ -11,7 +11,8 @@
     "start": "node --env-file=.env src/index.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1"
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "express": "^5.2.1"
   },
   "engines": {
     "node": ">=18"
